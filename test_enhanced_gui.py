@@ -6,10 +6,20 @@ Creates mock results to test filtering and expandable rows
 
 import sys
 import os
-sys.path.append(os.path.dirname(__file__))
-
-from load_test_gui import LoadTestGUI, TestResult
 import tkinter as tk
+from dataclasses import dataclass
+
+# Mock the TestResult class to avoid importing aiohttp
+@dataclass
+class TestResult:
+    session_id: int
+    status_code: int
+    duration: float
+    data_received: int
+    error: str = None
+
+# Import the GUI class by copying relevant parts
+sys.path.append(os.path.dirname(__file__))
 
 def create_test_data():
     """Create mock test results for testing"""

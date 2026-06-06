@@ -39,6 +39,12 @@ class LoadTestGUI:
         self.test_task = None
         self.results = []
         
+        # Initialize attributes for expandable results display
+        self.expanded_items = set()
+        self.tree_results = {}
+        self.results_summary_var = None
+        self.filter_vars = None
+        
         self.create_widgets()
         
     def create_widgets(self):
@@ -404,31 +410,41 @@ VERDICT:
         filter_frame = ttk.LabelFrame(details_frame, text="Filters", padding="5")
         filter_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Filter variables
-        show_successful = tk.BooleanVar(value=True)
-        show_failed = tk.BooleanVar(value=True)
-        show_errors_only = tk.BooleanVar(value=False)
-        
-        # Filter checkboxes
-        ttk.Checkbutton(filter_frame, text="Show Successful", variable=show_successful,
-                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(filter_frame, text="Show Failed", variable=show_failed,
-                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(filter_frame, text="Errors Only", variable=show_errors_only,
-                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Quick filter buttons
-        ttk.Button(filter_frame, text="Show All", 
-                  command=lambda: self.set_filter_all(show_successful, show_failed, show_errors_only, tree)).pack(side=tk.LEFT, padx=(20, 5))
-        ttk.Button(filter_frame, text="Errors Only", 
-                  command=lambda: self.set_filter_errors_only(show_successful, show_failed, show_errors_only, tree)).pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Create treeview for detailed results
+        # Create treeview for detailed results first
         tree_frame = ttk.Frame(details_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
         columns = ('Session', 'Status', 'Duration', 'Data (KB)', 'Summary')
         tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=15)
+        
+        # Filter variables
+        show_successful = tk.BooleanVar(value=True)
+        show_failed = tk.BooleanVar(value=True)
+        show_errors_only = tk.BooleanVar(value=False)
+        
+        # Update filter function for this specific tree
+        def update_filters():
+            self.update_results_display(tree, show_successful, show_failed, show_errors_only)
+        
+        def set_all_filters():
+            self.set_filter_all(show_successful, show_failed, show_errors_only, tree)
+            
+        def set_error_filters():
+            self.set_filter_errors_only(show_successful, show_failed, show_errors_only, tree)
+        
+        # Filter checkboxes
+        ttk.Checkbutton(filter_frame, text="Show Successful", variable=show_successful,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Show Failed", variable=show_failed,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Errors Only", variable=show_errors_only,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Quick filter buttons
+        ttk.Button(filter_frame, text="Show All", 
+                  command=set_all_filters).pack(side=tk.LEFT, padx=(20, 5))
+        ttk.Button(filter_frame, text="Errors Only", 
+                  command=set_error_filters).pack(side=tk.LEFT, padx=(5, 0))
         
         # Configure columns
         tree.heading('Session', text='Session ID')
@@ -443,9 +459,9 @@ VERDICT:
         tree.column('Data', width=100, anchor=tk.CENTER)
         tree.column('Summary', width=400, anchor=tk.W)
         
-        # Store expanded items and full result details
-        self.expanded_items = set()
-        self.tree_results = {}
+        # Clear any existing data from previous results windows
+        self.expanded_items.clear()
+        self.tree_results.clear()
         
         # Add scrollbars
         v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
