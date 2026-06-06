@@ -337,7 +337,7 @@ class LoadTestGUI:
             
         results_window = tk.Toplevel(self.root)
         results_window.title("Load Test Results - Detailed Report")
-        results_window.geometry("900x700")
+        results_window.geometry("1000x750")
         results_window.transient(self.root)
         results_window.grab_set()
         
@@ -400,11 +400,34 @@ VERDICT:
         details_frame = ttk.Frame(notebook, padding="10")
         notebook.add(details_frame, text="Detailed Results")
         
+        # Filter controls frame
+        filter_frame = ttk.LabelFrame(details_frame, text="Filters", padding="5")
+        filter_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Filter variables
+        show_successful = tk.BooleanVar(value=True)
+        show_failed = tk.BooleanVar(value=True)
+        show_errors_only = tk.BooleanVar(value=False)
+        
+        # Filter checkboxes
+        ttk.Checkbutton(filter_frame, text="Show Successful", variable=show_successful,
+                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Show Failed", variable=show_failed,
+                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Errors Only", variable=show_errors_only,
+                       command=lambda: self.update_results_display(tree, show_successful, show_failed, show_errors_only)).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Quick filter buttons
+        ttk.Button(filter_frame, text="Show All", 
+                  command=lambda: self.set_filter_all(show_successful, show_failed, show_errors_only, tree)).pack(side=tk.LEFT, padx=(20, 5))
+        ttk.Button(filter_frame, text="Errors Only", 
+                  command=lambda: self.set_filter_errors_only(show_successful, show_failed, show_errors_only, tree)).pack(side=tk.LEFT, padx=(5, 0))
+        
         # Create treeview for detailed results
         tree_frame = ttk.Frame(details_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('Session', 'Status', 'Duration', 'Data (KB)', 'Error')
+        columns = ('Session', 'Status', 'Duration', 'Data (KB)', 'Summary')
         tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=15)
         
         # Configure columns
@@ -412,13 +435,17 @@ VERDICT:
         tree.heading('Status', text='HTTP Status')
         tree.heading('Duration', text='Duration (s)')
         tree.heading('Data', text='Data (KB)')
-        tree.heading('Error', text='Error')
+        tree.heading('Summary', text='Summary/Error')
         
         tree.column('Session', width=80, anchor=tk.CENTER)
         tree.column('Status', width=80, anchor=tk.CENTER)
         tree.column('Duration', width=100, anchor=tk.CENTER)
         tree.column('Data', width=100, anchor=tk.CENTER)
-        tree.column('Error', width=300, anchor=tk.W)
+        tree.column('Summary', width=400, anchor=tk.W)
+        
+        # Store expanded items and full result details
+        self.expanded_items = set()
+        self.tree_results = {}
         
         # Add scrollbars
         v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
@@ -430,24 +457,165 @@ VERDICT:
         v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        # Populate tree with results
+        # Bind click events for expand/collapse
+        tree.bind('<Button-1>', lambda e: self.toggle_row_details(tree, e))
+        tree.bind('<Double-1>', lambda e: self.toggle_row_details(tree, e))
+        
+        # Initial population
+        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
+        
+        # Export button frame
+        button_frame = ttk.Frame(details_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        export_button = ttk.Button(button_frame, text="Export Results to JSON",
+                                 command=lambda: self.export_results())
+        export_button.pack(side=tk.LEFT)
+        
+        # Results summary label
+        self.results_summary_var = tk.StringVar()
+        summary_label = ttk.Label(button_frame, textvariable=self.results_summary_var)
+        summary_label.pack(side=tk.RIGHT)
+        
+        # Store filter variables for later use
+        self.filter_vars = (show_successful, show_failed, show_errors_only)
+    
+    def update_results_display(self, tree, show_successful, show_failed, show_errors_only):
+        """Update the results display based on filter settings"""
+        # Clear existing items
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        self.tree_results.clear()
+        self.expanded_items.clear()
+        
+        # Filter results based on settings
+        filtered_results = []
         for result in self.results:
+            is_successful = not result.error
+            is_failed = bool(result.error)
+            
+            if show_errors_only.get():
+                if is_failed:
+                    filtered_results.append(result)
+            else:
+                if (is_successful and show_successful.get()) or (is_failed and show_failed.get()):
+                    filtered_results.append(result)
+        
+        # Populate tree with filtered results
+        for result in filtered_results:
             status_display = result.status_code if result.status_code else "Error"
             data_kb = result.data_received / 1024
-            error_display = result.error[:50] + "..." if result.error and len(result.error) > 50 else (result.error or "")
             
-            tree.insert('', tk.END, values=(
-                result.session_id,
+            # Create summary text
+            if result.error:
+                summary = f"❌ {result.error[:60]}{'...' if len(result.error) > 60 else ''}"
+                status_icon = "❌"
+            else:
+                summary = f"✅ Successful request - {data_kb:.1f} KB transferred"
+                status_icon = "✅"
+            
+            item_id = tree.insert('', tk.END, values=(
+                f"{status_icon} {result.session_id}",
                 status_display,
                 f"{result.duration:.2f}",
                 f"{data_kb:.1f}",
-                error_display
-            ))
+                summary
+            ), tags=('collapsed',))
+            
+            # Store full result data
+            self.tree_results[item_id] = result
         
-        # Export button
-        export_button = ttk.Button(details_frame, text="Export Results to JSON",
-                                 command=lambda: self.export_results())
-        export_button.pack(pady=(10, 0))
+        # Update summary
+        total = len(filtered_results)
+        successful_count = len([r for r in filtered_results if not r.error])
+        failed_count = total - successful_count
+        
+        self.results_summary_var.set(f"Showing {total} results ({successful_count} successful, {failed_count} failed)")
+    
+    def set_filter_all(self, show_successful, show_failed, show_errors_only, tree):
+        """Set filters to show all results"""
+        show_successful.set(True)
+        show_failed.set(True)
+        show_errors_only.set(False)
+        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
+    
+    def set_filter_errors_only(self, show_successful, show_failed, show_errors_only, tree):
+        """Set filters to show only errors"""
+        show_successful.set(False)
+        show_failed.set(True)
+        show_errors_only.set(True)
+        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
+    
+    def toggle_row_details(self, tree, event):
+        """Toggle expanded details for a row"""
+        item = tree.identify_row(event.y)
+        if not item or item not in self.tree_results:
+            return
+        
+        result = self.tree_results[item]
+        
+        # Check if item is already expanded
+        if item in self.expanded_items:
+            # Collapse - remove detail rows
+            children = tree.get_children(item)
+            for child in children:
+                tree.delete(child)
+            self.expanded_items.remove(item)
+            
+            # Update main row to show collapsed state
+            values = list(tree.item(item)['values'])
+            if values[0].startswith('▼'):
+                values[0] = values[0].replace('▼', '▶', 1)
+                tree.item(item, values=values)
+        else:
+            # Expand - add detail rows
+            self.expanded_items.add(item)
+            
+            # Update main row to show expanded state
+            values = list(tree.item(item)['values'])
+            if values[0].startswith('▶'):
+                values[0] = values[0].replace('▶', '▼', 1)
+            else:
+                values[0] = '▼ ' + values[0].lstrip('✅❌ ')
+            tree.item(item, values=values)
+            
+            # Add detailed information as child rows
+            details = self.get_result_details(result)
+            for detail_line in details:
+                tree.insert(item, tk.END, values=('', '', '', '', f"   {detail_line}"), tags=('detail',))
+        
+        # Configure tag colors for detail rows
+        tree.tag_configure('detail', foreground='#666666', font=('Courier', 9))
+        tree.tag_configure('collapsed', background='white')
+    
+    def get_result_details(self, result):
+        """Get detailed information for a result"""
+        details = []
+        details.append(f"Session ID: {result.session_id}")
+        details.append(f"HTTP Status: {result.status_code if result.status_code else 'Connection Error'}")
+        details.append(f"Response Time: {result.duration:.3f} seconds")
+        details.append(f"Data Received: {result.data_received:,} bytes ({result.data_received/1024:.2f} KB)")
+        
+        if result.error:
+            details.append(f"Error Type: Connection/HTTP Error")
+            details.append(f"Error Message: {result.error}")
+            
+            # Add troubleshooting hints
+            if "timeout" in result.error.lower():
+                details.append("💡 Hint: Request timed out - server may be overloaded")
+            elif "502" in str(result.error):
+                details.append("💡 Hint: Bad Gateway - upstream server issue")
+            elif "connection" in result.error.lower():
+                details.append("💡 Hint: Connection issue - check network or server capacity")
+        else:
+            details.append("Status: ✅ Successful request")
+            if result.duration > 10:
+                details.append("⚠️ Note: Slow response time detected")
+            elif result.duration < 1:
+                details.append("⚡ Note: Fast response time")
+        
+        return details
     
     def export_results(self):
         """Export results to JSON file"""
