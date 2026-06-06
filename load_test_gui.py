@@ -154,12 +154,13 @@ class LoadTestGUI:
         return prompts.get(size, prompts["Medium"])
         
     async def make_request(self, session, session_id: int, prompt: str) -> TestResult:
-        """Make a single API request"""
+        """Make a single API request with improved error handling"""
         headers = {
             "Authorization": f"Bearer {self.jwt_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            "User-Agent": f"LoadTestGUI-Session-{session_id}"
+            "User-Agent": f"LoadTestGUI-Session-{session_id}",
+            "Connection": "keep-alive"
         }
         
         payload = {
@@ -176,23 +177,35 @@ class LoadTestGUI:
         status_code = None
         
         try:
-            async with session.post(self.api_url, json=payload, headers=headers, 
-                                  timeout=aiohttp.ClientTimeout(total=120)) as response:
+            # Add small delay for very high concurrency to avoid overwhelming
+            if session_id > 500:
+                await asyncio.sleep(0.001 * (session_id - 500))
+            
+            async with session.post(self.api_url, json=payload, headers=headers) as response:
                 status_code = response.status
                 
                 if response.status == 200:
-                    async for chunk in response.content.iter_chunked(1024):
+                    async for chunk in response.content.iter_chunked(8192):  # Larger chunks
                         if not self.is_running:  # Check if test was stopped
                             break
                         total_data += len(chunk)
                 else:
-                    error_text = await response.text()
-                    error = f"HTTP {response.status}: {error_text[:100]}"
+                    try:
+                        error_text = await response.text()
+                        error = f"HTTP {response.status}: {error_text[:200]}"
+                    except:
+                        error = f"HTTP {response.status}: Unable to read response body"
                     
         except asyncio.TimeoutError:
-            error = "Request timeout"
+            error = "Request timeout - server may be overloaded"
+        except aiohttp.ClientConnectorError as e:
+            error = f"Connection failed: {str(e)[:100]} (too many concurrent connections)"
+        except aiohttp.ServerDisconnectedError:
+            error = "Server disconnected - possible connection limit reached"
+        except aiohttp.ClientOSError as e:
+            error = f"OS level error: {str(e)[:100]} (connection pool exhausted)"
         except Exception as e:
-            error = f"Connection error: {str(e)[:100]}"
+            error = f"Unexpected error: {str(e)[:100]}"
         
         duration = time.time() - start_time
         
@@ -218,60 +231,137 @@ class LoadTestGUI:
         self.root.after(0, lambda: self.status_var.set("Initializing test..."))
         self.root.after(0, lambda: self.progress_var.set(0))
         
+        # Intelligent connection limits based on request count
+        max_concurrent = min(connections, 500)  # Cap at 500 concurrent
+        connector_limit = max_concurrent * 2
+        per_host_limit = max_concurrent
+        
         connector = aiohttp.TCPConnector(
-            limit=connections + 50,
-            limit_per_host=connections + 25,
-            keepalive_timeout=120,
-            enable_cleanup_closed=True
+            limit=connector_limit,
+            limit_per_host=per_host_limit,
+            keepalive_timeout=30,  # Shorter keepalive
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            force_close=False,  # Reuse connections
+            tcp_keepalive=True
         )
         
-        timeout = aiohttp.ClientTimeout(total=120, connect=30)
+        # More generous timeouts for high loads
+        timeout = aiohttp.ClientTimeout(total=300, connect=60, sock_read=60)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            self.root.after(0, lambda: self.status_var.set(f"Starting {connections} concurrent requests..."))
+        async with aiohttp.ClientSession(
+            connector=connector, 
+            timeout=timeout,
+            read_bufsize=32768  # Smaller read buffer for many connections
+        ) as session:
+            self.root.after(0, lambda: self.status_var.set(f"Starting {connections} requests with {max_concurrent} concurrent..."))
             
             start_time = time.time()
             
-            # Create semaphore to limit concurrent requests
-            semaphore = asyncio.Semaphore(connections)
-            
-            async def limited_request(session_id):
-                async with semaphore:
-                    return await self.make_request(session, session_id, prompt)
-            
-            # Create all tasks
-            tasks = [limited_request(i) for i in range(connections)]
-            
-            # Process results as they complete
-            for coro in asyncio.as_completed(tasks):
-                if not self.is_running:
-                    break
+            # Use smaller batches for very high loads
+            if connections > 1000:
+                batch_size = 250
+                self.root.after(0, lambda: self.status_var.set(f"Processing {connections} requests in batches of {batch_size}..."))
+                
+                # Process in batches
+                all_results = []
+                for batch_start in range(0, connections, batch_size):
+                    batch_end = min(batch_start + batch_size, connections)
+                    batch_ids = list(range(batch_start, batch_end))
                     
-                try:
-                    result = await coro
-                    self.results.append(result)
-                    completed_count += 1
+                    # Create semaphore for this batch
+                    batch_semaphore = asyncio.Semaphore(max_concurrent)
                     
-                    if result.error:
+                    async def limited_request(session_id):
+                        async with batch_semaphore:
+                            return await self.make_request(session, session_id, prompt)
+                    
+                    # Create tasks for this batch
+                    batch_tasks = [limited_request(i) for i in batch_ids]
+                    
+                    # Wait for batch completion
+                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    all_results.extend(batch_results)
+                    
+                    # Update progress
+                    batch_completed = len(all_results)
+                    progress = (batch_completed / connections) * 100
+                    self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                    self.root.after(0, lambda c=batch_completed: self.status_var.set(f"Completed batch {c//batch_size + 1}... {c}/{connections} total"))
+                    
+                    if not self.is_running:
+                        break
+                
+                # Process all results
+                completed_count = 0
+                error_count = 0
+                for result in all_results:
+                    if isinstance(result, Exception):
                         error_count += 1
-                    
-                    # Update metrics in UI thread
-                    progress = (completed_count / connections) * 100
-                    success_rate = ((completed_count - error_count) / completed_count * 100) if completed_count > 0 else 0
-                    
-                    successful_results = [r for r in self.results if not r.error]
-                    avg_response = sum(r.duration for r in successful_results) / len(successful_results) if successful_results else 0
-                    
-                    self.root.after(0, lambda: self.progress_var.set(progress))
-                    self.root.after(0, lambda: self.completed_var.set(str(completed_count)))
-                    self.root.after(0, lambda: self.errors_var.set(str(error_count)))
-                    self.root.after(0, lambda: self.success_rate_var.set(f"{success_rate:.1f}%"))
-                    self.root.after(0, lambda: self.avg_response_var.set(f"{avg_response:.1f}s"))
-                    self.root.after(0, lambda: self.status_var.set(f"Processing... {completed_count}/{connections} completed"))
-                    
-                except Exception as e:
-                    error_count += 1
-                    completed_count += 1
+                        completed_count += 1
+                        # Create error result
+                        self.results.append(TestResult(
+                            session_id=completed_count,
+                            status_code=0,
+                            duration=0,
+                            data_received=0,
+                            error=str(result)
+                        ))
+                    else:
+                        self.results.append(result)
+                        completed_count += 1
+                        if result.error:
+                            error_count += 1
+            else:
+                # Original method for smaller loads
+                semaphore = asyncio.Semaphore(max_concurrent)
+                
+                async def limited_request(session_id):
+                    async with semaphore:
+                        return await self.make_request(session, session_id, prompt)
+                
+                # Create all tasks
+                tasks = [limited_request(i) for i in range(connections)]
+                
+                # Process results as they complete
+                for coro in asyncio.as_completed(tasks):
+                    if not self.is_running:
+                        break
+                        
+                    try:
+                        result = await coro
+                        self.results.append(result)
+                        completed_count += 1
+                        
+                        if result.error:
+                            error_count += 1
+                        
+                        # Update metrics in UI thread
+                        progress = (completed_count / connections) * 100
+                        success_rate = ((completed_count - error_count) / completed_count * 100) if completed_count > 0 else 0
+                        
+                        successful_results = [r for r in self.results if not r.error]
+                        avg_response = sum(r.duration for r in successful_results) / len(successful_results) if successful_results else 0
+                        
+                        self.root.after(0, lambda: self.progress_var.set(progress))
+                        self.root.after(0, lambda: self.completed_var.set(str(completed_count)))
+                        self.root.after(0, lambda: self.errors_var.set(str(error_count)))
+                        self.root.after(0, lambda: self.success_rate_var.set(f"{success_rate:.1f}%"))
+                        self.root.after(0, lambda: self.avg_response_var.set(f"{avg_response:.1f}s"))
+                        self.root.after(0, lambda: self.status_var.set(f"Processing... {completed_count}/{connections} completed"))
+                        
+                    except Exception as e:
+                        error_count += 1
+                        completed_count += 1
+                        # Create error result for exception
+                        self.results.append(TestResult(
+                            session_id=completed_count,
+                            status_code=0,
+                            duration=0,
+                            data_received=0,
+                            error=str(e)
+                        ))
         
         total_duration = time.time() - start_time
         
