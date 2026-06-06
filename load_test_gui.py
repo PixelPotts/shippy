@@ -22,6 +22,8 @@ class TestResult:
     duration: float
     data_received: int
     error: str = None
+    response_content: str = None
+    prompt_sent: str = None
 
 class LoadTestGUI:
     def __init__(self, root):
@@ -175,6 +177,7 @@ class LoadTestGUI:
         total_data = 0
         error = None
         status_code = None
+        response_content = ""
         
         try:
             # Add small delay for very high concurrency to avoid overwhelming
@@ -185,10 +188,18 @@ class LoadTestGUI:
                 status_code = response.status
                 
                 if response.status == 200:
-                    async for chunk in response.content.iter_chunked(8192):  # Larger chunks
+                    # Parse SSE stream and extract Claude's response
+                    async for chunk in response.content.iter_chunked(8192):
                         if not self.is_running:  # Check if test was stopped
                             break
                         total_data += len(chunk)
+                        
+                        # Decode chunk and extract response content
+                        chunk_text = chunk.decode('utf-8', errors='ignore')
+                        response_content += chunk_text
+                        
+                    # Extract the final response from SSE events
+                    response_content = self.extract_claude_response(response_content)
                 else:
                     try:
                         error_text = await response.text()
@@ -214,8 +225,46 @@ class LoadTestGUI:
             status_code=status_code or 0,
             duration=duration,
             data_received=total_data,
-            error=error
+            error=error,
+            response_content=response_content[:2000] if response_content else None,  # Limit to 2000 chars
+            prompt_sent=prompt[:500] if prompt else None  # Limit to 500 chars
         )
+    
+    def extract_claude_response(self, sse_content: str) -> str:
+        """Extract Claude's response from Server-Sent Events format"""
+        if not sse_content:
+            return ""
+        
+        # Look for the final 'done' event with complete response
+        lines = sse_content.split('\n')
+        final_response = ""
+        
+        for line in lines:
+            if line.startswith('data: ') and '"type":"done"' in line:
+                try:
+                    # Parse the JSON from the done event
+                    json_str = line[6:]  # Remove 'data: ' prefix
+                    import json
+                    data = json.loads(json_str)
+                    if 'reply' in data:
+                        return data['reply']
+                except:
+                    pass
+        
+        # Fallback: concatenate all delta events
+        response_parts = []
+        for line in lines:
+            if line.startswith('data: ') and '"type":"delta"' in line:
+                try:
+                    json_str = line[6:]
+                    import json
+                    data = json.loads(json_str)
+                    if 'text' in data:
+                        response_parts.append(data['text'])
+                except:
+                    pass
+        
+        return ''.join(response_parts) if response_parts else "No response extracted"
     
     async def run_load_test(self):
         """Run the load test"""
@@ -305,7 +354,9 @@ class LoadTestGUI:
                             status_code=0,
                             duration=0,
                             data_received=0,
-                            error=str(result)
+                            error=str(result),
+                            response_content=None,
+                            prompt_sent=prompt
                         ))
                     else:
                         self.results.append(result)
@@ -359,7 +410,9 @@ class LoadTestGUI:
                             status_code=0,
                             duration=0,
                             data_received=0,
-                            error=str(e)
+                            error=str(e),
+                            response_content=None,
+                            prompt_sent=prompt
                         ))
         
         total_duration = time.time() - start_time
@@ -692,8 +745,18 @@ VERDICT:
         details.append(f"Response Time: {result.duration:.3f} seconds")
         details.append(f"Data Received: {result.data_received:,} bytes ({result.data_received/1024:.2f} KB)")
         
+        # Add prompt sent
+        if hasattr(result, 'prompt_sent') and result.prompt_sent:
+            details.append("")
+            details.append("📤 PROMPT SENT:")
+            # Split long prompts into multiple lines
+            prompt_lines = self._wrap_text(result.prompt_sent, 80)
+            for line in prompt_lines:
+                details.append(f"   {line}")
+        
         if result.error:
-            details.append(f"Error Type: Connection/HTTP Error")
+            details.append("")
+            details.append(f"❌ Error Type: Connection/HTTP Error")
             details.append(f"Error Message: {result.error}")
             
             # Add troubleshooting hints
@@ -704,13 +767,47 @@ VERDICT:
             elif "connection" in result.error.lower():
                 details.append("💡 Hint: Connection issue - check network or server capacity")
         else:
-            details.append("Status: ✅ Successful request")
+            details.append("")
+            details.append("✅ Status: Successful request")
             if result.duration > 10:
                 details.append("⚠️ Note: Slow response time detected")
             elif result.duration < 1:
                 details.append("⚡ Note: Fast response time")
+            
+            # Add Claude's response
+            if hasattr(result, 'response_content') and result.response_content:
+                details.append("")
+                details.append("📥 CLAUDE'S RESPONSE:")
+                # Split long responses into multiple lines
+                response_lines = self._wrap_text(result.response_content, 80)
+                for line in response_lines[:20]:  # Limit to first 20 lines
+                    details.append(f"   {line}")
+                if len(response_lines) > 20:
+                    details.append("   ... (response truncated)")
         
         return details
+    
+    def _wrap_text(self, text, width):
+        """Wrap text to specified width"""
+        if not text:
+            return []
+        
+        words = text.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            if len(current_line + " " + word) <= width:
+                current_line = current_line + " " + word if current_line else word
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        
+        if current_line:
+            lines.append(current_line)
+        
+        return lines
     
     def export_results(self):
         """Export results to JSON file"""
