@@ -414,39 +414,10 @@ VERDICT:
         tree_frame = ttk.Frame(details_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ('Session', 'Status', 'Duration', 'Data (KB)', 'Summary')
+        columns = ('Session', 'Status', 'Duration', 'Data', 'Summary')
         tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=15)
         
-        # Filter variables
-        show_successful = tk.BooleanVar(value=True)
-        show_failed = tk.BooleanVar(value=True)
-        show_errors_only = tk.BooleanVar(value=False)
-        
-        # Update filter function for this specific tree
-        def update_filters():
-            self.update_results_display(tree, show_successful, show_failed, show_errors_only)
-        
-        def set_all_filters():
-            self.set_filter_all(show_successful, show_failed, show_errors_only, tree)
-            
-        def set_error_filters():
-            self.set_filter_errors_only(show_successful, show_failed, show_errors_only, tree)
-        
-        # Filter checkboxes
-        ttk.Checkbutton(filter_frame, text="Show Successful", variable=show_successful,
-                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(filter_frame, text="Show Failed", variable=show_failed,
-                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(filter_frame, text="Errors Only", variable=show_errors_only,
-                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Quick filter buttons
-        ttk.Button(filter_frame, text="Show All", 
-                  command=set_all_filters).pack(side=tk.LEFT, padx=(20, 5))
-        ttk.Button(filter_frame, text="Errors Only", 
-                  command=set_error_filters).pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Configure columns
+        # Configure columns first
         tree.heading('Session', text='Session ID')
         tree.heading('Status', text='HTTP Status')
         tree.heading('Duration', text='Duration (s)')
@@ -477,9 +448,6 @@ VERDICT:
         tree.bind('<Button-1>', lambda e: self.toggle_row_details(tree, e))
         tree.bind('<Double-1>', lambda e: self.toggle_row_details(tree, e))
         
-        # Initial population
-        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
-        
         # Export button frame
         button_frame = ttk.Frame(details_frame)
         button_frame.pack(fill=tk.X, pady=(10, 0))
@@ -488,16 +456,51 @@ VERDICT:
                                  command=lambda: self.export_results())
         export_button.pack(side=tk.LEFT)
         
-        # Results summary label
-        self.results_summary_var = tk.StringVar()
-        summary_label = ttk.Label(button_frame, textvariable=self.results_summary_var)
+        # Results summary label - create local instance for this window
+        results_summary_var = tk.StringVar()
+        summary_label = ttk.Label(button_frame, textvariable=results_summary_var)
         summary_label.pack(side=tk.RIGHT)
         
-        # Store filter variables for later use
-        self.filter_vars = (show_successful, show_failed, show_errors_only)
+        # Filter variables
+        show_successful = tk.BooleanVar(value=True)
+        show_failed = tk.BooleanVar(value=True)
+        show_errors_only = tk.BooleanVar(value=False)
+        
+        # Update filter function for this specific tree and summary
+        def update_filters():
+            self.update_results_display_local(tree, show_successful, show_failed, show_errors_only, results_summary_var)
+        
+        def set_all_filters():
+            show_successful.set(True)
+            show_failed.set(True)
+            show_errors_only.set(False)
+            update_filters()
+            
+        def set_error_filters():
+            show_successful.set(False)
+            show_failed.set(True)
+            show_errors_only.set(True)
+            update_filters()
+        
+        # Filter checkboxes
+        ttk.Checkbutton(filter_frame, text="Show Successful", variable=show_successful,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Show Failed", variable=show_failed,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(filter_frame, text="Errors Only", variable=show_errors_only,
+                       command=update_filters).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Quick filter buttons
+        ttk.Button(filter_frame, text="Show All", 
+                  command=set_all_filters).pack(side=tk.LEFT, padx=(20, 5))
+        ttk.Button(filter_frame, text="Errors Only", 
+                  command=set_error_filters).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Initial population
+        update_filters()
     
-    def update_results_display(self, tree, show_successful, show_failed, show_errors_only):
-        """Update the results display based on filter settings"""
+    def update_results_display_local(self, tree, show_successful, show_failed, show_errors_only, summary_var):
+        """Update the results display based on filter settings for a specific tree"""
         # Clear existing items
         for item in tree.get_children():
             tree.delete(item)
@@ -532,7 +535,7 @@ VERDICT:
                 status_icon = "✅"
             
             item_id = tree.insert('', tk.END, values=(
-                f"{status_icon} {result.session_id}",
+                f"▶ {status_icon} {result.session_id}",
                 status_display,
                 f"{result.duration:.2f}",
                 f"{data_kb:.1f}",
@@ -547,21 +550,8 @@ VERDICT:
         successful_count = len([r for r in filtered_results if not r.error])
         failed_count = total - successful_count
         
-        self.results_summary_var.set(f"Showing {total} results ({successful_count} successful, {failed_count} failed)")
+        summary_var.set(f"Showing {total} results ({successful_count} successful, {failed_count} failed)")
     
-    def set_filter_all(self, show_successful, show_failed, show_errors_only, tree):
-        """Set filters to show all results"""
-        show_successful.set(True)
-        show_failed.set(True)
-        show_errors_only.set(False)
-        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
-    
-    def set_filter_errors_only(self, show_successful, show_failed, show_errors_only, tree):
-        """Set filters to show only errors"""
-        show_successful.set(False)
-        show_failed.set(True)
-        show_errors_only.set(True)
-        self.update_results_display(tree, show_successful, show_failed, show_errors_only)
     
     def toggle_row_details(self, tree, event):
         """Toggle expanded details for a row"""
