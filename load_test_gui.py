@@ -243,8 +243,7 @@ class LoadTestGUI:
             enable_cleanup_closed=True,
             ttl_dns_cache=300,
             use_dns_cache=True,
-            force_close=False,  # Reuse connections
-            tcp_keepalive=True
+            force_close=False  # Reuse connections
         )
         
         # More generous timeouts for high loads
