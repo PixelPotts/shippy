@@ -145,18 +145,21 @@ class LoadTestGUI:
         self.avg_response_var = tk.StringVar(value="0.0s")
         ttk.Label(metrics_frame, textvariable=self.avg_response_var, font=('Arial', 10, 'bold')).grid(row=1, column=3, sticky=tk.W)
         
-    def get_prompt_by_size(self, size: str) -> str:
-        """Get test prompt based on selected data size"""
-        prompts = {
-            "Small": "Hello, provide a brief response.",
-            "Medium": "Write a detailed explanation of API load testing including best practices, common metrics, and how to interpret results.",
-            "Large": "Generate a comprehensive guide to building scalable web applications including architecture patterns, database design, caching strategies, load balancing, monitoring, and deployment best practices with detailed examples.",
-            "Maximum": "Write a complete technical analysis covering distributed systems, microservices architecture, containerization, orchestration, CI/CD pipelines, monitoring and observability, security best practices, performance optimization, and scaling strategies with extensive code examples and detailed implementation guidelines."
-        }
-        return prompts.get(size, prompts["Medium"])
+    def get_conversation_prompts(self, size: str) -> tuple:
+        """Get conversation flow: (initial_greeting, followup_prompt)"""
+        initial_greeting = "Hi"
         
-    async def make_request(self, session, session_id: int, prompt: str) -> TestResult:
-        """Make a single API request with improved error handling"""
+        followup_prompts = {
+            "Small": "What's the weather like?",
+            "Medium": "Create a detailed plan to implement a SaaS for managing The US Govt major agencies. be precise and thorough",
+            "Large": "Generate a comprehensive strategic plan for modernizing all US federal government technology infrastructure, including cloud migration, cybersecurity, data governance, inter-agency coordination, citizen services digitization, and implementation timeline with budget estimates.",
+            "Maximum": "Develop a complete enterprise architecture blueprint for consolidating and modernizing all US federal government operations into a unified SaaS ecosystem, covering regulatory compliance, security frameworks, data sovereignty, legacy system integration, multi-agency workflows, citizen identity management, procurement processes, and detailed 10-year implementation roadmap with cost-benefit analysis."
+        }
+        
+        return initial_greeting, followup_prompts.get(size, followup_prompts["Medium"])
+        
+    async def make_conversation_request(self, session, session_id: int, greeting: str, main_prompt: str) -> TestResult:
+        """Make a conversation flow: greeting + main prompt"""
         headers = {
             "Authorization": f"Bearer {self.jwt_token}",
             "Content-Type": "application/json",
@@ -165,10 +168,11 @@ class LoadTestGUI:
             "Connection": "keep-alive"
         }
         
-        payload = {
-            "messages": [{"role": "user", "content": prompt}],
+        # First: Send greeting and get response
+        greeting_payload = {
+            "messages": [{"role": "user", "content": greeting}],
             "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 4096,
+            "max_tokens": 200,  # Short response for greeting
             "temperature": 0.7,
             "stream": True
         }
@@ -178,34 +182,83 @@ class LoadTestGUI:
         error = None
         status_code = None
         response_content = ""
+        greeting_response = ""
         
         try:
             # Add small delay for very high concurrency to avoid overwhelming
             if session_id > 500:
                 await asyncio.sleep(0.001 * (session_id - 500))
             
-            async with session.post(self.api_url, json=payload, headers=headers) as response:
+            # Step 1: Send greeting
+            async with session.post(self.api_url, json=greeting_payload, headers=headers) as response:
                 status_code = response.status
                 
                 if response.status == 200:
-                    # Parse SSE stream and extract Claude's response
+                    greeting_content = ""
                     async for chunk in response.content.iter_chunked(8192):
-                        if not self.is_running:  # Check if test was stopped
+                        if not self.is_running:
                             break
                         total_data += len(chunk)
-                        
-                        # Decode chunk and extract response content
+                        chunk_text = chunk.decode('utf-8', errors='ignore')
+                        greeting_content += chunk_text
+                    
+                    greeting_response = self.extract_claude_response(greeting_content)
+                else:
+                    try:
+                        error_text = await response.text()
+                        error = f"Greeting failed - HTTP {response.status}: {error_text[:200]}"
+                        return TestResult(
+                            session_id=session_id,
+                            status_code=status_code,
+                            duration=time.time() - start_time,
+                            data_received=total_data,
+                            error=error,
+                            response_content=None,
+                            prompt_sent=f"Greeting: {greeting}"
+                        )
+                    except:
+                        error = f"Greeting failed - HTTP {response.status}: Unable to read response body"
+                        return TestResult(
+                            session_id=session_id,
+                            status_code=status_code,
+                            duration=time.time() - start_time,
+                            data_received=total_data,
+                            error=error,
+                            response_content=None,
+                            prompt_sent=f"Greeting: {greeting}"
+                        )
+            
+            # Step 2: Send main prompt as follow-up
+            followup_payload = {
+                "messages": [
+                    {"role": "user", "content": greeting},
+                    {"role": "assistant", "content": greeting_response},
+                    {"role": "user", "content": main_prompt}
+                ],
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "stream": True
+            }
+            
+            async with session.post(self.api_url, json=followup_payload, headers=headers) as response:
+                status_code = response.status
+                
+                if response.status == 200:
+                    async for chunk in response.content.iter_chunked(8192):
+                        if not self.is_running:
+                            break
+                        total_data += len(chunk)
                         chunk_text = chunk.decode('utf-8', errors='ignore')
                         response_content += chunk_text
-                        
-                    # Extract the final response from SSE events
+                    
                     response_content = self.extract_claude_response(response_content)
                 else:
                     try:
                         error_text = await response.text()
-                        error = f"HTTP {response.status}: {error_text[:200]}"
+                        error = f"Main prompt failed - HTTP {response.status}: {error_text[:200]}"
                     except:
-                        error = f"HTTP {response.status}: Unable to read response body"
+                        error = f"Main prompt failed - HTTP {response.status}: Unable to read response body"
                     
         except asyncio.TimeoutError:
             error = "Request timeout - server may be overloaded"
@@ -220,6 +273,9 @@ class LoadTestGUI:
         
         duration = time.time() - start_time
         
+        # Combine full conversation for prompt_sent
+        full_conversation = f"1. {greeting}\n2. {main_prompt}"
+        
         return TestResult(
             session_id=session_id,
             status_code=status_code or 0,
@@ -227,7 +283,7 @@ class LoadTestGUI:
             data_received=total_data,
             error=error,
             response_content=response_content[:2000] if response_content else None,  # Limit to 2000 chars
-            prompt_sent=prompt[:500] if prompt else None  # Limit to 500 chars
+            prompt_sent=full_conversation[:500] if full_conversation else None  # Limit to 500 chars
         )
     
     def extract_claude_response(self, sse_content: str) -> str:
@@ -270,7 +326,7 @@ class LoadTestGUI:
         """Run the load test"""
         connections = int(self.connections_var.get())
         duration = int(self.duration_var.get())
-        prompt = self.get_prompt_by_size(self.data_size_var.get())
+        greeting, main_prompt = self.get_conversation_prompts(self.data_size_var.get())
         
         self.results = []
         completed_count = 0
@@ -323,7 +379,7 @@ class LoadTestGUI:
                     
                     async def limited_request(session_id):
                         async with batch_semaphore:
-                            return await self.make_request(session, session_id, prompt)
+                            return await self.make_conversation_request(session, session_id, greeting, main_prompt)
                     
                     # Create tasks for this batch
                     batch_tasks = [limited_request(i) for i in batch_ids]
@@ -356,7 +412,7 @@ class LoadTestGUI:
                             data_received=0,
                             error=str(result),
                             response_content=None,
-                            prompt_sent=prompt
+                            prompt_sent=f"1. {greeting}\n2. {main_prompt}"
                         ))
                     else:
                         self.results.append(result)
@@ -369,7 +425,7 @@ class LoadTestGUI:
                 
                 async def limited_request(session_id):
                     async with semaphore:
-                        return await self.make_request(session, session_id, prompt)
+                        return await self.make_conversation_request(session, session_id, greeting, main_prompt)
                 
                 # Create all tasks
                 tasks = [limited_request(i) for i in range(connections)]
@@ -412,7 +468,7 @@ class LoadTestGUI:
                             data_received=0,
                             error=str(e),
                             response_content=None,
-                            prompt_sent=prompt
+                            prompt_sent=f"1. {greeting}\n2. {main_prompt}"
                         ))
         
         total_duration = time.time() - start_time
